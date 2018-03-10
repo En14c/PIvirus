@@ -60,8 +60,8 @@ global pi_hostile_fclose, pi_get_hostile_len
 pi_hostile_fclose:
 
 
-    clear_regs
     save_regs
+    clear_regs
     
     push RANDOM_NUM
 
