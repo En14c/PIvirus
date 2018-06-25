@@ -20,11 +20,6 @@ PIvirus is a proof of concept for infecting linux x86_64 ELF binaries using PLT 
   <img alt="PIvirus-demo" src ="https://media.giphy.com/media/5WJe29jCGuVHrjJI0W/giphy.gif"/>
 </p>
 
-## TODO
-
-- [ ] machine code obfuscation
-- [ ] anti-debugging
-
 ## License
 
 MIT
